@@ -1,7 +1,7 @@
 /*
 	cc_mux.c: Insert raw closed captions into MPEG files
 	Run file without arguments to see usage
-	Version 1.0
+	Version 1.2
 	McPoodle (mcpoodle43@yahoo.com)
 	Part of SCC_TOOLS:
 		http://www.geocities.com/mcpoodle43/SCC_TOOLS/DOCS/SCC_TOOLS.HTML
@@ -11,6 +11,9 @@
  
 	Version History
 	1.0 initial release
+    1.1 added Top_Field_First and Repeat_First_Field to count_ccgops(),
+        changed CCtruncate to CCextra
+    1.2 fixed Top_Field_First and Repeat_First_Field use
 */
 
 #include "cc_mux.h"
@@ -180,7 +183,7 @@ int main(int argc, char* argv[])
 void usage(void)
 {
 	using namespace std;
-	cout << endl << "CC_MUX Version 1.0" << endl;
+	cout << endl << "CC_MUX Version 1.2" << endl;
 	cout << "  Inserts closed captions in raw format into an MPEG file" << endl;
 	cout << "    (Video Elementary Stream, not Program Stream)." << endl << endl;
 	cout << "  Syntax 1: CC_MUX -g infile1.ga infile2.m2v infile3.bin outfile.m2v" << endl;
@@ -192,7 +195,7 @@ void usage(void)
 	cout << "         (DEFAULT: base name of infile2 plus _CC and same extension)" << endl << endl;
     cout << "  Syntax 2: CC_MUX -a outfile.ga infile.m2v" << endl;
     cout << "    -a outfile.ga: output CC GOP structure to outfile.ga" << endl;
-    cout << "    infile.m2v: MPEG 1 or 2 video file with closed captions to analyze" << endl << endl;
+    cout << "    infile.???: MPEG 1 or 2 video file with closed captions to analyze" << endl << endl;
 	return;
 }
 
@@ -250,6 +253,7 @@ nextpass:
 
 void count_gops(std::string MPGinputfile) {
 	char tmpStr[256];
+	unsigned char CCpattern, CCextra, CCframes, CCextraFields;
 	unsigned long i, j;
 	size_t n;
 
@@ -257,16 +261,37 @@ void count_gops(std::string MPGinputfile) {
 	n = MPGinputfile.copy(tmpStr, 256, 0);
 	tmpStr[n] = 0x00;
 	init_getbits(tmpStr);
+	gopidx = -1;
+    CCpattern = 0;
+    CCextra = 0;
+    CCframes = 0;
+    CCextraFields = 0;
 	do {
 		i = getbits(32);
 nextpass:
 		switch (i) {
 			case GROUP_START_CODE:
-				gopidx++;
-				gopframes[gopidx] = 0;
+                gopcaptions[gopidx++] = (CCpattern * 128) + (CCframes * 2) + CCextraFields;
+                CCpattern = 0;
+                CCextra = 0;
+                CCframes = 0;
+                CCextraFields = 0;
 				break;
+            case EXTENSION_START_CODE:
+                j = getbits(4);
+                if (j == PICTURE_CODING_EXTENSION) {
+                  j = getbits(20); // unused
+                  CCpattern = get1bit(); // Top_Field_First
+                  j = getbits(5); // unused
+                  CCextra = get1bit(); // Repeat_First_Field
+                  if (CCextra == 1) {
+                    CCextraFields++;
+                  }
+                  j = getbits(25); // unused
+                }
+                break;
 			case PICTURE_START_CODE:
-				gopframes[gopidx]++;
+				CCframes++;
 				break;
 			case USER_DATA_START_CODE:
 				cout << "Please remove all user data from input MPEG before running" << endl;
@@ -286,6 +311,7 @@ nextpass:
 	} while ((i != MPEG_PROGRAM_END_CODE) && (!end_bs()));
 
 	finish_getbits();
+    gopcaptions[gopidx++] = (CCpattern * 128) + (CCframes * 2) + CCextraFields;
 	return;
 }
 
@@ -324,7 +350,7 @@ void readGA(std::string GAinputfile) {
 void mux(std::string MPGinputfile, std::string BINinputfile, std::string MPGoutputfile, int useCCanalysis) {
 	char tmpStr[256];
 	unsigned long i, j, k;
-	unsigned char CCpattern, CCtruncate, CCframes;
+	unsigned char CCpattern, CCextra, CCframes;
 	size_t n;
 	bool gop_started = false;
 
@@ -364,21 +390,15 @@ mainloop:
 			case PICTURE_START_CODE:
 				if (gop_started) {
 					gop_started = false;
-					if (useCCanalysis) {
-						// printf("%d,%d ", gopidx, gopcaptions[gopidx]);
-						if (gopcaptions[gopidx] > 0) {
-							j = gopcaptions[gopidx];
-							CCpattern = j >> 7;
-							CCtruncate = j & 0x01;
-							CCframes = j & 0x7f;
-							CCframes >>= 1;
-						} else {
-							CCframes = 0;
-						}
+    				// printf("%d,%d ", gopidx, gopcaptions[gopidx]);
+					if (gopcaptions[gopidx] > 0) {
+						j = gopcaptions[gopidx];
+						CCpattern = j >> 7;
+						CCextra = j & 0x01;
+						CCframes = j & 0x7f;
+						CCframes >>= 1;
 					} else {
-						CCpattern = 1;	// default to Field 1, Field 2
-						CCtruncate = 0;	// default to not truncate
-						CCframes = gopframes[gopidx];
+						CCframes = 0;
 					}
 					if (CCframes == 0) {
 						break;
@@ -389,11 +409,11 @@ mainloop:
 					write_bytes(DVD_CLOSED_CAPTION, 4);
 					// Attribute byte:
 					//  2 x GOP size,
-					//  plus 0 not to truncate,
+					//  plus 0 not to add an extra field,
 					//  plus 0x80 to use the pattern Field 1, Field 2
-					j = (CCframes*2) + CCtruncate + (CCpattern * 0x80);
+					j = (CCframes*2) + CCextra + (CCpattern * 0x80);
 					write1byte(j);
-					if (CCtruncate)
+					if (CCextra)
 						CCframes++;
 					for (j=0; j<CCframes; j++) {
 						// first field
@@ -415,7 +435,7 @@ mainloop:
 						} else {
 							write_bytes(0x8080, 2);
 						}
-						if (((j+1) == CCframes) && CCtruncate) {
+						if (((j+1) == CCframes) && CCextra) {
 							continue;
 						}
 						// second field
